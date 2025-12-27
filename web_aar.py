@@ -1,97 +1,116 @@
 import streamlit as st
-import sqlite3
 import datetime
-from google import genai
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
+from google import genai
 
 # --- CONFIGURATION ---
-DB_FILE = "daily_aar.db"
-
-# Try to get the key from Streamlit Secrets (Cloud), otherwise use local fallback
-try:
-    MY_API_KEY = st.secrets["GOOGLE_API_KEY"]
-except:
-    # If running locally on your machine, paste your key here for testing
-    MY_API_KEY = "PASTE_YOUR_GOOGLE_API_KEY_HERE"
+SHEET_NAME = "Daily_AAR_DB"  # The exact name of your Google Sheet
 
 # --- SETUP & STYLING ---
-st.set_page_config(page_title="Daily AAR", page_icon="🚀", layout="centered")
+st.set_page_config(page_title="Team AAR", page_icon="🚀", layout="centered")
 
-# --- INITIALIZE DATABASE (MOVED TO TOP) ---
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS aars (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            date_logged TEXT,
-            time_logged TEXT,
-            went_right TEXT,
-            went_wrong TEXT,
-            next_steps TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# --- AUTHENTICATION & CONNECTIONS ---
 
-# Run this immediately so the table exists before we try to read it
-init_db()
+# 1. Google Sheets Connection (Cached to avoid reconnecting every time)
+@st.cache_resource
+def get_gspread_client():
+    # Load credentials from Streamlit Secrets
+    try:
+        # We access the 'gcp_service_account' section from secrets.toml
+        secrets_dict = st.secrets["gcp_service_account"]
+        
+        # Define the scope (what we are allowed to do)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        
+        # Create credentials object
+        creds = Credentials.from_service_account_info(secrets_dict, scopes=scopes)
+        return gspread.authorize(creds)
+    except Exception as e:
+        st.error(f"❌ Could not connect to Google Sheets: {e}")
+        return None
 
-# --- AI CLIENT ---
+# 2. AI Connection
 @st.cache_resource
 def get_ai_client():
     try:
-        return genai.Client(api_key=MY_API_KEY)
+        return genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
     except:
         return None
 
-client = get_ai_client()
+# --- DATABASE FUNCTIONS (Replaced SQLite with GSpread) ---
 
-# --- DATABASE FUNCTIONS ---
-def save_to_db(user, right, wrong, next_time):
-    now = datetime.datetime.now()
+def init_sheet_headers(client):
+    """Checks if the sheet is empty and adds headers if needed."""
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO aars (username, date_logged, time_logged, went_right, went_wrong, next_steps)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user, now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), right, wrong, next_time))
-        conn.commit()
-        conn.close()
+        sheet = client.open(SHEET_NAME).sheet1
+        # If cell A1 is empty, we assume it's a new sheet
+        if not sheet.acell('A1').value:
+            sheet.append_row([
+                "Date", "Time", "User", "Went Right", "Went Wrong", "Next Steps"
+            ])
+    except Exception as e:
+        st.warning(f"Could not initialize sheet headers: {e}")
+
+def save_to_sheet(client, user, right, wrong, next_time):
+    now = datetime.datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M:%S")
+    
+    try:
+        sheet = client.open(SHEET_NAME).sheet1
+        # Atomic append - safe for multiple users
+        sheet.append_row([
+            date_str, time_str, user, right, wrong, next_time
+        ])
         return True
     except Exception as e:
-        st.error(f"Database Error: {e}")
+        st.error(f"Failed to save to Google Sheet: {e}")
         return False
 
-def load_history(user=None):
-    conn = sqlite3.connect(DB_FILE)
-    # We use a try/except block here just in case pandas has trouble reading an empty DB
+def load_history_from_sheet(client, user_filter=None):
     try:
-        query = "SELECT * FROM aars ORDER BY id DESC"
-        df = pd.read_sql_query(query, conn)
-        conn.close()
+        sheet = client.open(SHEET_NAME).sheet1
+        # Get all records as a list of dictionaries
+        data = sheet.get_all_records()
+        df = pd.DataFrame(data)
         
-        if user:
-            df = df[df['username'] == user]
-        return df
+        if df.empty:
+            return df
+            
+        # Filter by user if requested
+        if user_filter and user_filter != "All Users":
+            df = df[df['User'] == user_filter]
+            
+        # Sort by Date descending (since sheet append adds to bottom, we flip it)
+        # Note: In a real app, you might want a proper ID column, but this works
+        return df.iloc[::-1] 
+        
     except Exception as e:
-        conn.close()
-        return pd.DataFrame() # Return empty table if it fails
+        st.error(f"Could not load history: {e}")
+        return pd.DataFrame()
 
-def generate_ai_tip(user):
-    if not client:
+def generate_ai_tip(ai_client, history_df, user):
+    if not ai_client:
         return "AI Error: Client not connected."
     
-    df = load_history(user).head(5)
-    
-    if df.empty:
+    if history_df.empty:
         return "Log more entries to get AI coaching!"
 
+    # Take the last 5 entries (from the top of our reversed dataframe)
+    recent_history = history_df.head(5)
+    
     history_text = ""
-    for index, row in df.iterrows():
-        history_text += f"- Date: {row['date_logged']}\n  Went Wrong: {row['went_wrong']}\n  Went Right: {row['went_right']}\n\n"
+    for index, row in recent_history.iterrows():
+        # Handle cases where column names might vary slightly
+        w_wrong = row.get('Went Wrong', '')
+        w_right = row.get('Went Right', '')
+        date_val = row.get('Date', '')
+        history_text += f"- Date: {date_val}\n  Went Wrong: {w_wrong}\n  Went Right: {w_right}\n\n"
 
     prompt = f"""
     You are an expert Agile Team Coach.
@@ -105,22 +124,30 @@ def generate_ai_tip(user):
     """
     
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash", 
+        # Use stable model
+        response = ai_client.models.generate_content(
+            model="gemini-1.5-flash", 
             contents=prompt
         )
         return response.text
     except Exception as e:
         return f"AI Connection Error: {e}"
 
-# --- THE WEBSITE LAYOUT ---
+# --- MAIN APP LOGIC ---
+
+# Initialize Clients
+gs_client = get_gspread_client()
+ai_client = get_ai_client()
+
+if gs_client:
+    init_sheet_headers(gs_client)
 
 st.sidebar.header("User Settings")
 team_members = ["Select Name...", "Kyle", "Sarah", "Mike", "Admin"]
 current_user = st.sidebar.selectbox("Who are you?", team_members)
 
-st.title("🚀 Team Daily AAR")
-st.markdown(f"**Date:** {datetime.datetime.now().strftime('%A, %B %d, %Y')}")
+st.title("🚀 Team Daily AAR (Cloud DB)")
+st.caption(f"Connected to: {SHEET_NAME}")
 
 tab1, tab2 = st.tabs(["📝 Log Entry", "📜 View History"])
 
@@ -141,28 +168,32 @@ with tab1:
                 if not right and not wrong:
                     st.error("Please fill out at least one field.")
                 else:
-                    success = save_to_db(current_user, right, wrong, next_time)
-                    if success:
-                        st.success("Entry Saved!")
-                        with st.spinner("Analyzing your patterns..."):
-                            tip = generate_ai_tip(current_user)
-                            st.info(f"💡 **AI Coach:** {tip}")
+                    if gs_client:
+                        with st.spinner("Saving to Google Sheets..."):
+                            success = save_to_sheet(gs_client, current_user, right, wrong, next_time)
+                            
+                        if success:
+                            st.success("Entry Saved to Cloud!")
+                            
+                            # AI Analysis
+                            with st.spinner("Analyzing your patterns..."):
+                                # Reload history to include the new entry for the AI
+                                history_df = load_history_from_sheet(gs_client, current_user)
+                                tip = generate_ai_tip(ai_client, history_df, current_user)
+                                st.info(f"💡 **AI Coach:** {tip}")
 
 # --- TAB 2: VIEW HISTORY ---
 with tab2:
-    st.header("Team History")
-    filter_user = st.selectbox("Filter by User:", ["All Users"] + team_members[1:])
-    
-    if filter_user == "All Users":
-        df = load_history()
-    else:
-        df = load_history(filter_user)
+    if gs_client:
+        filter_user = st.selectbox("Filter by User:", ["All Users"] + team_members[1:])
+        
+        df = load_history_from_sheet(gs_client, filter_user)
 
-    if df.empty:
-        st.write("No records found.")
-    else:
-        st.dataframe(
-            df[['date_logged', 'username', 'went_right', 'went_wrong', 'next_steps']],
-            use_container_width=True,
-            hide_index=True
-        )
+        if df.empty:
+            st.info("No records found in the Google Sheet yet.")
+        else:
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True
+            )
