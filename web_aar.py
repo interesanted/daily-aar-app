@@ -126,7 +126,7 @@ def generate_ai_tip(ai_client, history_df, user):
     try:
         # Use stable model
         response = ai_client.models.generate_content(
-            model="gemini-1.5-flash", 
+            model="gemini-2.5-flash", 
             contents=prompt
         )
         return response.text
@@ -143,7 +143,7 @@ if gs_client:
     init_sheet_headers(gs_client)
 
 st.sidebar.header("User Settings")
-team_members = ["Select Name...", "Kyle", "Sarah", "Mike", "Admin"]
+team_members = ["Select Name...", "Kyle", "Jake", "Dennis", "Admin"]
 current_user = st.sidebar.selectbox("Who are you?", team_members)
 
 st.title("🚀 Team Daily AAR (Cloud DB)")
@@ -197,3 +197,4 @@ with tab2:
                 use_container_width=True,
                 hide_index=True
             )
+
